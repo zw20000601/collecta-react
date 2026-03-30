@@ -33,6 +33,8 @@ const FILTER_TABS = [
 ]
 
 const PRIORITY_COLUMNS_MISSING_REGEX = /column\s+messages\.(yesterday_vote_count|priority_date)\s+does\s+not\s+exist/i
+const MESSAGE_CACHE_PREFIX = 'collecta:messages:v2'
+const MESSAGE_REFRESH_DEBOUNCE_MS = 420
 
 function normalizeCategory(value) {
   if (value && CATEGORY_META[value]) return value
@@ -82,6 +84,7 @@ export default function Messages({ user }) {
   const activeTab = parseTab(searchParams.get('category'))
   const sortBy = parseSort(searchParams.get('sort'))
   const keyword = String(searchParams.get('keyword') || '')
+  const cacheKey = `${MESSAGE_CACHE_PREFIX}:${activeTab}:${sortBy}:${keyword.trim().toLowerCase()}`
 
   const [posts, setPosts] = useState([])
   const [postsStatus, setPostsStatus] = useState('')
@@ -107,6 +110,7 @@ export default function Messages({ user }) {
   const schemaErrorNotifiedRef = useRef(false)
   const schemaUnsupportedRef = useRef(false)
   const priorityFallbackNotifiedRef = useRef(false)
+  const refreshTimerRef = useRef(null)
 
   function updateQuery(next) {
     const params = new URLSearchParams(searchParams)
@@ -138,7 +142,7 @@ export default function Messages({ user }) {
     if (reset) {
       pageRef.current = 0
       setHasMore(true)
-      setLoading(true)
+      setLoading(!posts.length)
       setPostsStatus('')
     } else {
       setLoadingMore(true)
@@ -295,12 +299,28 @@ export default function Messages({ user }) {
       })
     }
 
+    let mergedPosts = mapped
     setPosts((prev) => {
       if (reset) return mapped
       const exists = new Set(prev.map((item) => item.id))
       const append = mapped.filter((item) => !exists.has(item.id))
-      return [...prev, ...append]
+      mergedPosts = [...prev, ...append]
+      return mergedPosts
     })
+
+    if (reset) {
+      const cachePayload = {
+        cachedAt: Date.now(),
+        posts: mapped,
+      }
+      sessionStorage.setItem(cacheKey, JSON.stringify(cachePayload))
+    } else {
+      const cachePayload = {
+        cachedAt: Date.now(),
+        posts: mergedPosts,
+      }
+      sessionStorage.setItem(cacheKey, JSON.stringify(cachePayload))
+    }
 
     if (rows.length < PAGE_SIZE) {
       setHasMore(false)
@@ -312,11 +332,45 @@ export default function Messages({ user }) {
     setLoading(false)
     setLoadingMore(false)
     loadingRef.current = false
-  }, [activeTab, sortBy, keyword, user])
+  }, [activeTab, sortBy, keyword, user, posts.length, cacheKey])
+
+  const scheduleRefresh = useCallback((reset) => {
+    if (refreshTimerRef.current) {
+      window.clearTimeout(refreshTimerRef.current)
+    }
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null
+      loadPosts(reset)
+    }, MESSAGE_REFRESH_DEBOUNCE_MS)
+  }, [loadPosts])
 
   useEffect(() => {
-    loadPosts(true)
-  }, [loadPosts])
+    const raw = sessionStorage.getItem(cacheKey)
+    if (!raw) return
+
+    try {
+      const parsed = JSON.parse(raw)
+      const cachedPosts = Array.isArray(parsed && parsed.posts) ? parsed.posts : []
+      if (!cachedPosts.length) return
+
+      setPosts(cachedPosts)
+      setLoading(false)
+      setHasMore(true)
+      setPostsStatus('已加载缓存，正在同步最新留言...')
+    } catch (_error) {
+      sessionStorage.removeItem(cacheKey)
+    }
+  }, [cacheKey])
+
+  useEffect(() => {
+    scheduleRefresh(true)
+    return () => {
+      if (refreshTimerRef.current) {
+        window.clearTimeout(refreshTimerRef.current)
+        refreshTimerRef.current = null
+      }
+    }
+  }, [scheduleRefresh])
 
   useEffect(() => {
     const channel = supabase
@@ -324,24 +378,28 @@ export default function Messages({ user }) {
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'messages' },
-        () => loadPosts(true),
+        () => scheduleRefresh(true),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'message_replies' },
-        () => loadPosts(true),
+        () => scheduleRefresh(true),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'message_votes' },
-        () => loadPosts(true),
+        () => scheduleRefresh(true),
       )
       .subscribe()
 
     return () => {
+      if (refreshTimerRef.current) {
+        window.clearTimeout(refreshTimerRef.current)
+        refreshTimerRef.current = null
+      }
       supabase.removeChannel(channel)
     }
-  }, [loadPosts])
+  }, [scheduleRefresh])
 
   useEffect(() => {
     if (!hasMore || loading || loadingMore) return
@@ -351,7 +409,7 @@ export default function Messages({ user }) {
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries[0] && entries[0].isIntersecting) {
-          loadPosts(false)
+          scheduleRefresh(false)
         }
       },
       { rootMargin: '280px 0px' },
@@ -359,7 +417,7 @@ export default function Messages({ user }) {
 
     observer.observe(node)
     return () => observer.disconnect()
-  }, [hasMore, loading, loadingMore, loadPosts])
+  }, [hasMore, loading, loadingMore, scheduleRefresh])
 
   function toggleExpand(postId) {
     setExpandedSet((prev) => {

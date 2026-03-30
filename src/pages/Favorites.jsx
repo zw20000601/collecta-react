@@ -6,6 +6,8 @@ import { normalizeResource } from '../lib/resourceUtils'
 import ResourceCard from '../components/ResourceCard'
 import HeroClouds from '../components/HeroClouds'
 
+const FAVORITES_CACHE_PREFIX = 'collecta:favorites:v2'
+
 function normalizeText(value) {
   return String(value || '').trim().toLowerCase()
 }
@@ -24,17 +26,39 @@ export default function Favorites({ user }) {
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState('all')
   const [sortBy, setSortBy] = useState('latest')
+  const cacheKey = `${FAVORITES_CACHE_PREFIX}:${user ? user.id : 'guest'}`
+
+  useEffect(() => {
+    if (!user) return
+    const raw = sessionStorage.getItem(cacheKey)
+    if (!raw) return
+    try {
+      const parsed = JSON.parse(raw)
+      const cached = Array.isArray(parsed && parsed.resources) ? parsed.resources : []
+      if (!cached.length) return
+      setResources(cached)
+      setLoading(false)
+      setStatus('已加载缓存，正在同步收藏...')
+    } catch (_error) {
+      sessionStorage.removeItem(cacheKey)
+    }
+  }, [user, cacheKey])
 
   useEffect(() => {
     if (user) loadFavorites()
   }, [user])
 
   async function loadFavorites() {
-    setLoading(true)
+    if (!resources.length) setLoading(true)
 
     const { data: rows, error: favError } = await supabase
       .from('favorites')
-      .select('id,resource_id,created_at')
+      .select(`
+        id,
+        resource_id,
+        created_at,
+        resource:resources(*)
+      `)
       .eq('user_id', user.id)
       .order('created_at', { ascending: false })
 
@@ -47,31 +71,20 @@ export default function Favorites({ user }) {
       return
     }
 
-    const ids = (rows || []).map((item) => item.resource_id)
-    if (!ids.length) {
+    const normalizedFromJoin = (rows || [])
+      .map((item) => normalizeResource(item && item.resource))
+      .filter(Boolean)
+
+    if (!normalizedFromJoin.length) {
       setResources([])
       setStatus('还没有收藏资源')
       setLoading(false)
+      sessionStorage.setItem(cacheKey, JSON.stringify({ cachedAt: Date.now(), resources: [] }))
       return
     }
 
-    const { data: resourceRows, error: resourceError } = await supabase
-      .from('resources')
-      .select('*')
-      .in('id', ids)
-
-    if (resourceError) {
-      const msg = `读取资源失败：${resourceError.message}`
-      setStatus(msg)
-      notifyError(msg)
-      setResources([])
-      setLoading(false)
-      return
-    }
-
-    const map = new Map((resourceRows || []).map((item) => [item.id, normalizeResource(item)]))
-    const ordered = ids.map((id) => map.get(id)).filter(Boolean)
-    setResources(ordered)
+    setResources(normalizedFromJoin)
+    sessionStorage.setItem(cacheKey, JSON.stringify({ cachedAt: Date.now(), resources: normalizedFromJoin }))
     setStatus('收藏已同步')
     setLoading(false)
   }
@@ -88,7 +101,17 @@ export default function Favorites({ user }) {
       return
     }
 
-    setResources((prev) => prev.filter((item) => item.id !== resource.id))
+    setResources((prev) => {
+      const next = prev.filter((item) => item.id !== resource.id)
+      sessionStorage.setItem(
+        cacheKey,
+        JSON.stringify({
+          cachedAt: Date.now(),
+          resources: next,
+        }),
+      )
+      return next
+    })
     setStatus('已取消收藏')
     notifySuccess('已取消收藏')
   }
