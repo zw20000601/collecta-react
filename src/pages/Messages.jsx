@@ -106,6 +106,7 @@ export default function Messages({ user }) {
   const sentinelRef = useRef(null)
   const schemaErrorNotifiedRef = useRef(false)
   const schemaUnsupportedRef = useRef(false)
+  const priorityFallbackNotifiedRef = useRef(false)
 
   function updateQuery(next) {
     const params = new URLSearchParams(searchParams)
@@ -183,8 +184,9 @@ export default function Messages({ user }) {
       const fallback = await buildQuery(false)
       data = fallback.data
       error = fallback.error
-      if (!fallback.error) {
-        notifyInfo('留言板已回退为最新发布排序，请执行 SQL 升级后启用“昨日高票优先”')
+      if (!fallback.error && !priorityFallbackNotifiedRef.current) {
+        notifyInfo('当前数据库尚未启用“昨日高票优先”，已自动按最新发布显示。')
+        priorityFallbackNotifiedRef.current = true
       }
     }
 
@@ -659,13 +661,16 @@ export default function Messages({ user }) {
                       type="button"
                       className={`mb-vote-btn ${isVoted ? 'active' : ''}`}
                       onClick={() => toggleVote(post)}
-                      aria-label="投票"
+                      aria-label={isVoted ? '取消投票' : '投票'}
                     >
                       <svg className="mb-vote-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                        <polyline points="6 14 12 8 18 14" />
+                        <path d="M7 10v10H3V10h4z" />
+                        <path d="M7 20h9.2a2.1 2.1 0 0 0 2-1.5l1.3-5a2.1 2.1 0 0 0-2-2.6H14V6.8c0-1.1-.9-2-2-2h-.2l-3.2 5.1c-.4.6-.6 1.2-.6 1.9V20z" />
                       </svg>
+                      <span>{isVoted ? '已投票' : '投票'}</span>
                     </button>
                     <strong>{post.vote_count}</strong>
+                    <small className="mb-vote-unit">票</small>
                   </div>
 
                   <div className="mb-post-main">

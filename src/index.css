@@ -1600,27 +1600,37 @@ button.nav-cta {
 }
 
 .mb-vote-btn {
-  width: 34px;
-  height: 34px;
+  min-width: 72px;
+  height: 36px;
   border-radius: 10px;
   border: 1px solid #BFC8D8;
   background: #fff;
   color: var(--gray-600);
   cursor: pointer;
-  display: inline-flex;
+  display: flex;
+  gap: 6px;
   align-items: center;
   justify-content: center;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 700;
   transition: all .2s ease;
 }
 
 .mb-vote-icon {
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
 }
 
 .mb-vote-btn.active {
   border-color: #1D9E75;
   background: #E1F5EE;
+  color: #085041;
+  box-shadow: 0 4px 14px rgba(29, 158, 117, 0.18);
+}
+
+.mb-vote-btn:hover {
+  border-color: #1D9E75;
   color: #085041;
 }
 
@@ -1629,6 +1639,12 @@ button.nav-cta {
   color: #111827;
   line-height: 1;
   font-weight: 700;
+}
+
+.mb-vote-unit {
+  color: var(--gray-400);
+  font-size: 12px;
+  line-height: 1;
 }
 
 .mb-post-main {
@@ -3675,7 +3691,7 @@ button.nav-cta {
   .mb-search input { min-width: 0; width: 100%; }
   .mb-filter-right select { width: 100%; }
   .mb-post-card { grid-template-columns: 1fr; }
-  .mb-vote-col { grid-template-columns: auto auto; justify-content: start; align-items: center; }
+  .mb-vote-col { grid-template-columns: auto auto auto; justify-content: start; align-items: center; }
   .mb-post-head h3 { font-size: 22px; }
   .mb-post-content { font-size: 16px; }
   .admin-message-head,
