@@ -32,6 +32,8 @@ const FILTER_TABS = [
   { key: 'bug', label: '问题反馈' },
 ]
 
+const PRIORITY_COLUMNS_MISSING_REGEX = /column\s+messages\.(yesterday_vote_count|priority_date)\s+does\s+not\s+exist/i
+
 function normalizeCategory(value) {
   if (value && CATEGORY_META[value]) return value
   return 'other'
@@ -144,30 +146,47 @@ export default function Messages({ user }) {
     const from = pageRef.current * PAGE_SIZE
     const to = from + PAGE_SIZE - 1
 
-    let query = supabase
-      .from('messages')
-      .select('id,user_id,title,content,category,status,is_done,created_at,vote_count,reply_count')
+    function buildQuery(enableDailyPriority) {
+      let query = supabase
+        .from('messages')
+        .select('id,user_id,title,content,category,status,is_done,created_at,vote_count,reply_count')
 
-    if (activeTab !== 'all') {
-      query = query.eq('category', activeTab)
+      if (activeTab !== 'all') {
+        query = query.eq('category', activeTab)
+      }
+
+      if (sortBy === 'votes') {
+        query = query.order('vote_count', { ascending: false }).order('created_at', { ascending: false })
+      } else if (sortBy === 'pending') {
+        query = query.eq('status', 'pending').order('created_at', { ascending: false })
+      } else if (enableDailyPriority) {
+        // 默认排序: 每天优先展示“昨日高票”留言，再按发布时间排序
+        query = query
+          .order('yesterday_vote_count', { ascending: false })
+          .order('created_at', { ascending: false })
+      } else {
+        query = query.order('created_at', { ascending: false })
+      }
+
+      if (keyword.trim()) {
+        const safe = keyword.trim().replaceAll(',', ' ').replaceAll('%', ' ')
+        query = query.or(`title.ilike.%${safe}%,content.ilike.%${safe}%`)
+      }
+
+      return query.range(from, to)
     }
 
-    if (sortBy === 'votes') {
-      query = query.order('vote_count', { ascending: false }).order('created_at', { ascending: false })
-    } else if (sortBy === 'pending') {
-      query = query.eq('status', 'pending').order('created_at', { ascending: false })
-    } else {
-      query = query.order('created_at', { ascending: false })
+    let { data, error } = await buildQuery(true)
+
+    if (error && PRIORITY_COLUMNS_MISSING_REGEX.test(String(error.message || ''))) {
+      // 兼容: 如果你还没执行新增字段 SQL, 自动回退到“最新发布”
+      const fallback = await buildQuery(false)
+      data = fallback.data
+      error = fallback.error
+      if (!fallback.error) {
+        notifyInfo('留言板已回退为最新发布排序，请执行 SQL 升级后启用“昨日高票优先”')
+      }
     }
-
-    if (keyword.trim()) {
-      const safe = keyword.trim().replaceAll(',', ' ').replaceAll('%', ' ')
-      query = query.or(`title.ilike.%${safe}%,content.ilike.%${safe}%`)
-    }
-
-    query = query.range(from, to)
-
-    const { data, error } = await query
 
     if (error) {
       const rawMessage = String(error.message || '')

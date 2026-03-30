@@ -401,3 +401,73 @@ for each row execute procedure public.handle_message_replies_change();
 create trigger trg_message_replies_after_delete
 after delete on public.message_replies
 for each row execute procedure public.handle_message_replies_change();
+
+-- =========================================================
+-- Daily Priority for Message Board (yesterday top votes first)
+-- 每天早上按“前一天投票数”更新优先级
+-- =========================================================
+
+alter table public.messages add column if not exists yesterday_vote_count integer not null default 0;
+alter table public.messages add column if not exists priority_date date;
+
+create index if not exists idx_messages_priority_order
+  on public.messages (yesterday_vote_count desc, created_at desc);
+
+create index if not exists idx_message_votes_created_at
+  on public.message_votes (created_at);
+
+create or replace function public.refresh_messages_daily_priority(
+  target_day date default ((now() at time zone 'Asia/Shanghai')::date - 1)
+)
+returns void
+language sql
+as $$
+  update public.messages m
+  set yesterday_vote_count = coalesce(v.cnt, 0),
+      priority_date = target_day
+  from (
+    select mv.post_id, count(*)::int as cnt
+    from public.message_votes mv
+    where (mv.created_at at time zone 'Asia/Shanghai')::date = target_day
+    group by mv.post_id
+  ) v
+  where m.id = v.post_id;
+
+  update public.messages m
+  set yesterday_vote_count = 0,
+      priority_date = target_day
+  where not exists (
+    select 1
+    from public.message_votes mv
+    where mv.post_id = m.id
+      and (mv.created_at at time zone 'Asia/Shanghai')::date = target_day
+  );
+$$;
+
+-- 先手动执行一次，立即生成昨日优先级
+select public.refresh_messages_daily_priority();
+
+-- 自动任务：UTC 00:00 = 北京时间 08:00
+-- 若环境不支持 pg_cron，会自动跳过并给出 notice，不影响其余 SQL。
+do $block$
+declare
+  job_id bigint;
+begin
+  execute 'create extension if not exists pg_cron';
+
+  for job_id in
+    select j.jobid from cron.job j where j.jobname = 'messages_daily_priority_8am_cst'
+  loop
+    perform cron.unschedule(job_id);
+  end loop;
+
+  perform cron.schedule(
+    'messages_daily_priority_8am_cst',
+    '0 0 * * *',
+    $job$select public.refresh_messages_daily_priority();$job$
+  );
+exception
+  when others then
+    raise notice 'pg_cron schedule skipped: %', sqlerrm;
+end;
+$block$;
