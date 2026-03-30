@@ -46,13 +46,13 @@ export default function Categories() {
 
     let result = await supabase
       .from('resources')
-      .select('id,category,is_public,public')
+      .select('id,category,is_public')
       .eq('is_public', true)
 
     if (result.error && /column .*is_public/i.test(result.error.message || '')) {
       result = await supabase
         .from('resources')
-        .select('id,category,is_public,public')
+        .select('id,category,public')
         .eq('public', true)
     }
 

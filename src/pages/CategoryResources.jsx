@@ -10,7 +10,8 @@ const PAGE_SIZE = 12
 const RESOURCE_REFRESH_DEBOUNCE_MS = 320
 const CATEGORY_RESOURCES_CACHE_PREFIX = 'collecta:category-resources:v3'
 const CATEGORY_LIST_CACHE_KEY = 'collecta:resource-categories:v1'
-const RESOURCE_SELECT_FIELDS = 'id,user_id,title,url,category,tags,note,description,is_public,public,cover_url,created_at,favorite_count,favorites_count,bookmark_count,view_count,views_count,visit_count,views'
+const RESOURCE_SELECT_FIELDS = 'id,user_id,title,url,category,tags,note,description,is_public,cover_url,created_at,favorite_count,favorites_count,bookmark_count,view_count,views_count,visit_count,views'
+const RESOURCE_SELECT_FIELDS_LEGACY = 'id,user_id,title,url,category,tags,note,description,public,cover_url,created_at,favorite_count,favorites_count,bookmark_count,view_count,views_count,visit_count,views'
 
 const SORT_OPTIONS = [
   { value: 'latest', label: '最新添加' },
@@ -238,7 +239,7 @@ export default function CategoryResources({ user }) {
     if (result.error && /column .*is_public/i.test(result.error.message || '')) {
       let fallbackRequest = supabase
         .from('resources')
-        .select(RESOURCE_SELECT_FIELDS)
+        .select(RESOURCE_SELECT_FIELDS_LEGACY)
         .eq('public', true)
         .order('created_at', { ascending: false })
       if (currentCategory !== ALL) {
