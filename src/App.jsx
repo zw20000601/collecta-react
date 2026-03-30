@@ -7,14 +7,23 @@ import SiteFooter from './components/SiteFooter'
 import ErrorBoundary from './components/ErrorBoundary'
 import ToastHost from './components/ToastHost'
 
-const Home = lazy(() => import('./pages/Home'))
-const Categories = lazy(() => import('./pages/Categories'))
-const CategoryResources = lazy(() => import('./pages/CategoryResources'))
-const Favorites = lazy(() => import('./pages/Favorites'))
-const Messages = lazy(() => import('./pages/Messages'))
-const Login = lazy(() => import('./pages/Login'))
-const Admin = lazy(() => import('./pages/Admin'))
-const AdminLogin = lazy(() => import('./pages/AdminLogin'))
+const loadHome = () => import('./pages/Home')
+const loadCategories = () => import('./pages/Categories')
+const loadCategoryResources = () => import('./pages/CategoryResources')
+const loadFavorites = () => import('./pages/Favorites')
+const loadMessages = () => import('./pages/Messages')
+const loadLogin = () => import('./pages/Login')
+const loadAdmin = () => import('./pages/Admin')
+const loadAdminLogin = () => import('./pages/AdminLogin')
+
+const Home = lazy(loadHome)
+const Categories = lazy(loadCategories)
+const CategoryResources = lazy(loadCategoryResources)
+const Favorites = lazy(loadFavorites)
+const Messages = lazy(loadMessages)
+const Login = lazy(loadLogin)
+const Admin = lazy(loadAdmin)
+const AdminLogin = lazy(loadAdminLogin)
 
 function withTimeout(promise, ms, label) {
   return Promise.race([
@@ -39,6 +48,46 @@ export default function App() {
 
   const isAdmin = Boolean(user && String(authRole || '').toLowerCase() === 'admin')
   const isAdminSection = location.pathname.startsWith('/admin')
+
+  function prefetchRoute(routePath) {
+    const path = String(routePath || '')
+    if (!path) return
+
+    if (path === '/') {
+      loadHome().catch(() => {})
+      return
+    }
+
+    if (path === '/categories') {
+      loadCategories().catch(() => {})
+      return
+    }
+
+    if (path.startsWith('/categories/')) {
+      loadCategoryResources().catch(() => {})
+      return
+    }
+
+    if (path === '/favorites') {
+      loadFavorites().catch(() => {})
+      return
+    }
+
+    if (path === '/messages') {
+      loadMessages().catch(() => {})
+      return
+    }
+
+    if (path === '/login') {
+      loadLogin().catch(() => {})
+      return
+    }
+
+    if (path.startsWith('/admin')) {
+      loadAdminLogin().catch(() => {})
+      if (isAdmin) loadAdmin().catch(() => {})
+    }
+  }
 
   useEffect(() => {
     let mounted = true
@@ -99,6 +148,36 @@ export default function App() {
     }
   }, [])
 
+  useEffect(() => {
+    if (loading) return undefined
+
+    let idleId = null
+    let timerId = null
+    const warmup = () => {
+      loadHome().catch(() => {})
+      loadCategories().catch(() => {})
+      loadCategoryResources().catch(() => {})
+      loadFavorites().catch(() => {})
+      loadMessages().catch(() => {})
+      loadLogin().catch(() => {})
+    }
+
+    if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+      idleId = window.requestIdleCallback(warmup, { timeout: 2000 })
+    } else {
+      timerId = window.setTimeout(warmup, 1000)
+    }
+
+    return () => {
+      if (idleId !== null && typeof window !== 'undefined' && 'cancelIdleCallback' in window) {
+        window.cancelIdleCallback(idleId)
+      }
+      if (timerId !== null) {
+        window.clearTimeout(timerId)
+      }
+    }
+  }, [loading])
+
   async function handleLogout() {
     await supabase.auth.signOut()
     sessionStorage.removeItem('isGuest')
@@ -114,9 +193,9 @@ export default function App() {
     return <div className="page-loading">Collecta 正在连接中...</div>
   }
 
-  return (
+    return (
     <ErrorBoundary>
-      {!isAdminSection ? <Navbar user={user} isGuest={isGuest} onLogout={handleLogout} /> : null}
+      {!isAdminSection ? <Navbar user={user} isGuest={isGuest} onLogout={handleLogout} onPrefetchRoute={prefetchRoute} /> : null}
       <Suspense fallback={<div className="page-loading">页面加载中...</div>}>
         <Routes>
           <Route path="/" element={<Home user={user} isGuest={isGuest} />} />
