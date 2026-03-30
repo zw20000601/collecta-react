@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 import { createResourceSlug, normalizeResource, normalizeTags, parseQueryKeyword } from '../lib/resourceUtils'
@@ -7,6 +7,10 @@ import { DEFAULT_RESOURCE_CATEGORIES, getDefaultCategoryName, normalizeResourceC
 
 const ALL = '全部'
 const PAGE_SIZE = 12
+const RESOURCE_REFRESH_DEBOUNCE_MS = 320
+const CATEGORY_RESOURCES_CACHE_PREFIX = 'collecta:category-resources:v3'
+const CATEGORY_LIST_CACHE_KEY = 'collecta:resource-categories:v1'
+const RESOURCE_SELECT_FIELDS = 'id,user_id,title,url,category,tags,note,description,is_public,public,cover_url,created_at,favorite_count,favorites_count,bookmark_count,view_count,views_count,visit_count,views'
 
 const SORT_OPTIONS = [
   { value: 'latest', label: '最新添加' },
@@ -77,6 +81,10 @@ export default function CategoryResources({ user }) {
   const [params] = useSearchParams()
 
   const currentCategory = useMemo(() => decodeCategoryName(categoryName), [categoryName])
+  const cacheKey = useMemo(() => `${CATEGORY_RESOURCES_CACHE_PREFIX}:${currentCategory}`, [currentCategory])
+  const refreshTimerRef = useRef(null)
+  const resourcesRef = useRef([])
+  const favoriteCountsRef = useRef({})
 
   const [loading, setLoading] = useState(true)
   const [status, setStatus] = useState('加载中...')
@@ -94,6 +102,14 @@ export default function CategoryResources({ user }) {
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
+    resourcesRef.current = resources
+  }, [resources])
+
+  useEffect(() => {
+    favoriteCountsRef.current = favoriteCounts
+  }, [favoriteCounts])
+
+  useEffect(() => {
     setSearchKeyword(params.get('q') || '')
     setSortBy(params.get('sort') || 'latest')
   }, [params])
@@ -101,6 +117,27 @@ export default function CategoryResources({ user }) {
   useEffect(() => {
     setSelectedTags([])
   }, [currentCategory])
+
+  useEffect(() => {
+    const raw = sessionStorage.getItem(cacheKey)
+    if (!raw) return
+    try {
+      const parsed = JSON.parse(raw)
+      const cachedResources = Array.isArray(parsed && parsed.resources) ? parsed.resources : []
+      const cachedFavoriteCounts =
+        parsed && parsed.favoriteCounts && typeof parsed.favoriteCounts === 'object'
+          ? parsed.favoriteCounts
+          : {}
+      if (cachedResources.length) {
+        setResources(cachedResources)
+        setFavoriteCounts(cachedFavoriteCounts)
+        setLoading(false)
+        setStatus(currentCategory === ALL ? '已加载缓存资源，正在同步...' : `已加载「${currentCategory}」缓存，正在同步...`)
+      }
+    } catch (_error) {
+      sessionStorage.removeItem(cacheKey)
+    }
+  }, [cacheKey, currentCategory])
 
   const loadCategoryList = useCallback(async () => {
     const result = await supabase
@@ -111,16 +148,31 @@ export default function CategoryResources({ user }) {
       .order('created_at', { ascending: true })
 
     if (result.error) {
+      const cachedRaw = sessionStorage.getItem(CATEGORY_LIST_CACHE_KEY)
+      if (cachedRaw) {
+        try {
+          const parsed = JSON.parse(cachedRaw)
+          const cachedRows = Array.isArray(parsed && parsed.rows) ? parsed.rows : []
+          if (cachedRows.length) {
+            setCategoryList(withFallbackCategories(cachedRows))
+            return
+          }
+        } catch (_error) {
+          sessionStorage.removeItem(CATEGORY_LIST_CACHE_KEY)
+        }
+      }
       setCategoryList(DEFAULT_RESOURCE_CATEGORIES)
       return
     }
 
     const rows = (result.data || []).map((item, index) => normalizeResourceCategoryRow(item, index))
     setCategoryList(withFallbackCategories(rows))
+    sessionStorage.setItem(CATEGORY_LIST_CACHE_KEY, JSON.stringify({ cachedAt: Date.now(), rows }))
   }, [])
 
   const refreshFavoriteStats = useCallback(
-    async (rows) => {
+    async (rows, options = {}) => {
+      const includeAggregate = Boolean(options.includeAggregate)
       const ids = rows.map((item) => item.id).filter(Boolean)
       if (!ids.length) {
         setFavoriteCounts({})
@@ -129,22 +181,24 @@ export default function CategoryResources({ user }) {
       }
 
       const aggregate = {}
-      const countResult = await supabase
-        .from('favorites')
-        .select('resource_id')
-        .in('resource_id', ids)
+      if (includeAggregate) {
+        const countResult = await supabase
+          .from('favorites')
+          .select('resource_id')
+          .in('resource_id', ids)
 
-      if (!countResult.error) {
-        ;(countResult.data || []).forEach((item) => {
-          const key = item.resource_id
-          aggregate[key] = (aggregate[key] || 0) + 1
-        })
+        if (!countResult.error) {
+          ;(countResult.data || []).forEach((item) => {
+            const key = item.resource_id
+            aggregate[key] = (aggregate[key] || 0) + 1
+          })
+          setFavoriteCounts(aggregate)
+        }
       }
-      setFavoriteCounts(aggregate)
 
       if (!user) {
         setFavorites(new Set())
-        return
+        return { favoriteCounts: aggregate, favorites: [] }
       }
 
       const ownResult = await supabase
@@ -155,20 +209,23 @@ export default function CategoryResources({ user }) {
 
       if (ownResult.error) {
         setFavorites(new Set())
-        return
+        return { favoriteCounts: aggregate, favorites: [] }
       }
 
-      setFavorites(new Set((ownResult.data || []).map((item) => item.resource_id)))
+      const ownFavorites = (ownResult.data || []).map((item) => item.resource_id)
+      setFavorites(new Set(ownFavorites))
+      return { favoriteCounts: aggregate, favorites: ownFavorites }
     },
     [user],
   )
 
-  const loadResources = useCallback(async () => {
-    setLoading(true)
+  const loadResources = useCallback(async (options = {}) => {
+    const silent = Boolean(options.silent)
+    if (!silent && !resourcesRef.current.length) setLoading(true)
 
     let request = supabase
       .from('resources')
-      .select('*')
+      .select(RESOURCE_SELECT_FIELDS)
       .eq('is_public', true)
       .order('created_at', { ascending: false })
 
@@ -181,7 +238,7 @@ export default function CategoryResources({ user }) {
     if (result.error && /column .*is_public/i.test(result.error.message || '')) {
       let fallbackRequest = supabase
         .from('resources')
-        .select('*')
+        .select(RESOURCE_SELECT_FIELDS)
         .eq('public', true)
         .order('created_at', { ascending: false })
       if (currentCategory !== ALL) {
@@ -193,18 +250,43 @@ export default function CategoryResources({ user }) {
     if (result.error) {
       const msg = `读取资源失败：${result.error.message}`
       setStatus(msg)
-      setResources([])
+      if (!resourcesRef.current.length) setResources([])
       notifyError(msg)
-      setLoading(false)
+      if (!resourcesRef.current.length) setLoading(false)
       return
     }
 
     const rows = (result.data || []).map(normalizeResource)
     setResources(rows)
     setStatus(currentCategory === ALL ? '已加载全部公开资源' : `已加载「${currentCategory}」分类资源`)
-    await refreshFavoriteStats(rows)
     setLoading(false)
-  }, [currentCategory, refreshFavoriteStats])
+    sessionStorage.setItem(cacheKey, JSON.stringify({ cachedAt: Date.now(), resources: rows, favoriteCounts: favoriteCountsRef.current }))
+
+    const includeAggregate = sortBy === 'favorites'
+    refreshFavoriteStats(rows, { includeAggregate })
+      .then((stats) => {
+        if (!stats || typeof stats !== 'object') return
+        const nextFavoriteCounts = includeAggregate ? stats.favoriteCounts || {} : favoriteCountsRef.current
+        sessionStorage.setItem(
+          cacheKey,
+          JSON.stringify({
+            cachedAt: Date.now(),
+            resources: rows,
+            favoriteCounts: nextFavoriteCounts,
+          }),
+        )
+      })
+      .catch(() => {})
+  }, [cacheKey, currentCategory, refreshFavoriteStats, sortBy])
+
+  const scheduleRefresh = useCallback((options = {}) => {
+    if (refreshTimerRef.current) {
+      clearTimeout(refreshTimerRef.current)
+    }
+    refreshTimerRef.current = setTimeout(() => {
+      loadResources({ silent: true, ...options })
+    }, RESOURCE_REFRESH_DEBOUNCE_MS)
+  }, [loadResources])
 
   useEffect(() => {
     loadCategoryList()
@@ -217,15 +299,15 @@ export default function CategoryResources({ user }) {
   useEffect(() => {
     const channel = supabase
       .channel(`category-resources-sync-${currentCategory}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'resources' }, loadResources)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'favorites' }, loadResources)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'resources' }, () => scheduleRefresh())
       .on('postgres_changes', { event: '*', schema: 'public', table: 'resource_categories' }, loadCategoryList)
       .subscribe()
 
     return () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
       supabase.removeChannel(channel)
     }
-  }, [currentCategory, loadCategoryList, loadResources])
+  }, [currentCategory, loadCategoryList, scheduleRefresh])
 
   const categoryNames = useMemo(
     () => categoryList.map((item) => item.name).filter(Boolean),
@@ -264,10 +346,10 @@ export default function CategoryResources({ user }) {
 
   function getFavoriteCount(resource) {
     return extractCount(
+      favoriteCounts[resource.id],
       resource.favorite_count,
       resource.favorites_count,
       resource.bookmark_count,
-      favoriteCounts[resource.id],
       0,
     )
   }

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
-import { normalizeResource, parseQueryKeyword } from '../lib/resourceUtils'
+import { parseQueryKeyword } from '../lib/resourceUtils'
 import { notifyError } from '../lib/notify'
 import HeroClouds from '../components/HeroClouds'
 import CategoryIcon from '../components/CategoryIcon'
@@ -12,6 +12,9 @@ import {
 } from '../lib/resourceCategories'
 
 const ALL = '全部'
+const CATEGORY_RESOURCES_CACHE_KEY = 'collecta:categories-public-counts:v3'
+const CATEGORY_LIST_CACHE_KEY = 'collecta:resource-categories:v1'
+const CATEGORY_REFRESH_DEBOUNCE_MS = 320
 
 function toCategoryPath(name) {
   if (name === ALL) return '/categories/all'
@@ -21,6 +24,8 @@ function toCategoryPath(name) {
 export default function Categories() {
   const navigate = useNavigate()
   const [params] = useSearchParams()
+  const refreshTimerRef = useRef(null)
+  const resourcesRef = useRef([])
 
   const [resources, setResources] = useState([])
   const [categoryList, setCategoryList] = useState(DEFAULT_RESOURCE_CATEGORIES)
@@ -32,49 +37,46 @@ export default function Categories() {
   }, [params])
 
   useEffect(() => {
-    loadCategoryList()
-    loadResources()
-  }, [])
+    resourcesRef.current = resources
+  }, [resources])
 
-  useEffect(() => {
-    const channel = supabase
-      .channel('categories-home-sync')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'resource_categories' }, loadCategoryList)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'resources' }, loadResources)
-      .subscribe()
+  const loadResources = useCallback(async (options = {}) => {
+    const silent = Boolean(options.silent)
+    if (!silent) setStatus('正在同步公开资源...')
 
-    return () => {
-      supabase.removeChannel(channel)
-    }
-  }, [])
-
-  async function loadResources() {
     let result = await supabase
       .from('resources')
-      .select('*')
+      .select('id,category,is_public,public')
       .eq('is_public', true)
-      .order('created_at', { ascending: false })
 
     if (result.error && /column .*is_public/i.test(result.error.message || '')) {
       result = await supabase
         .from('resources')
-        .select('*')
+        .select('id,category,is_public,public')
         .eq('public', true)
-        .order('created_at', { ascending: false })
     }
 
     if (result.error) {
-      setResources([])
-      setStatus(`读取资源失败：${result.error.message}`)
-      notifyError(`读取资源失败：${result.error.message}`)
+      const msg = `读取资源失败：${result.error.message}`
+      setStatus(msg)
+      if (!resourcesRef.current.length) setResources([])
+      notifyError(msg)
       return
     }
 
-    setResources((result.data || []).map(normalizeResource))
+    const nextResources = (result.data || []).map((item) => ({
+      id: item.id,
+      category: String(item && item.category ? item.category : '').trim(),
+    }))
+    setResources(nextResources)
     setStatus('公开资源已加载')
-  }
+    sessionStorage.setItem(
+      CATEGORY_RESOURCES_CACHE_KEY,
+      JSON.stringify({ cachedAt: Date.now(), resources: nextResources }),
+    )
+  }, [])
 
-  async function loadCategoryList() {
+  const loadCategoryList = useCallback(async () => {
     const result = await supabase
       .from('resource_categories')
       .select('id,name,emoji,sort_order,is_active,created_at')
@@ -83,13 +85,79 @@ export default function Categories() {
       .order('created_at', { ascending: true })
 
     if (result.error) {
+      const cachedRaw = sessionStorage.getItem(CATEGORY_LIST_CACHE_KEY)
+      if (cachedRaw) {
+        try {
+          const parsed = JSON.parse(cachedRaw)
+          const cachedRows = Array.isArray(parsed && parsed.rows) ? parsed.rows : []
+          if (cachedRows.length) {
+            setCategoryList(withFallbackCategories(cachedRows))
+            return
+          }
+        } catch (_error) {
+          sessionStorage.removeItem(CATEGORY_LIST_CACHE_KEY)
+        }
+      }
       setCategoryList(DEFAULT_RESOURCE_CATEGORIES)
       return
     }
 
     const rows = (result.data || []).map((item, index) => normalizeResourceCategoryRow(item, index))
     setCategoryList(withFallbackCategories(rows))
-  }
+    sessionStorage.setItem(CATEGORY_LIST_CACHE_KEY, JSON.stringify({ cachedAt: Date.now(), rows }))
+  }, [])
+
+  const scheduleResourcesRefresh = useCallback(() => {
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+    refreshTimerRef.current = setTimeout(() => {
+      loadResources({ silent: true })
+    }, CATEGORY_REFRESH_DEBOUNCE_MS)
+  }, [loadResources])
+
+  useEffect(() => {
+    const categoryCacheRaw = sessionStorage.getItem(CATEGORY_LIST_CACHE_KEY)
+    if (categoryCacheRaw) {
+      try {
+        const parsed = JSON.parse(categoryCacheRaw)
+        const cachedRows = Array.isArray(parsed && parsed.rows) ? parsed.rows : []
+        if (cachedRows.length) {
+          setCategoryList(withFallbackCategories(cachedRows))
+        }
+      } catch (_error) {
+        sessionStorage.removeItem(CATEGORY_LIST_CACHE_KEY)
+      }
+    }
+
+    const resourceCacheRaw = sessionStorage.getItem(CATEGORY_RESOURCES_CACHE_KEY)
+    if (resourceCacheRaw) {
+      try {
+        const parsed = JSON.parse(resourceCacheRaw)
+        const cachedResources = Array.isArray(parsed && parsed.resources) ? parsed.resources : []
+        if (cachedResources.length) {
+          setResources(cachedResources)
+          setStatus('已加载缓存，正在同步公开资源...')
+        }
+      } catch (_error) {
+        sessionStorage.removeItem(CATEGORY_RESOURCES_CACHE_KEY)
+      }
+    }
+
+    loadCategoryList()
+    loadResources()
+  }, [loadCategoryList, loadResources])
+
+  useEffect(() => {
+    const channel = supabase
+      .channel('categories-home-sync')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'resource_categories' }, loadCategoryList)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'resources' }, scheduleResourcesRefresh)
+      .subscribe()
+
+    return () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+      supabase.removeChannel(channel)
+    }
+  }, [loadCategoryList, scheduleResourcesRefresh])
 
   function onSearchSubmit(event) {
     event.preventDefault()
@@ -98,9 +166,19 @@ export default function Categories() {
     navigate(`/categories/all${qs}`)
   }
 
+  const categoryCountMap = useMemo(() => {
+    const map = new Map()
+    resources.forEach((item) => {
+      const key = String(item && item.category ? item.category : '').trim()
+      if (!key) return
+      map.set(key, (map.get(key) || 0) + 1)
+    })
+    return map
+  }, [resources])
+
   function getCategoryCount(name) {
     if (name === ALL) return resources.length
-    return resources.filter((item) => String(item.category || '').trim() === name).length
+    return categoryCountMap.get(name) || 0
   }
 
   const categoryCards = useMemo(
