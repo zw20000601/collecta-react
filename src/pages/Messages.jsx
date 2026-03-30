@@ -264,8 +264,14 @@ export default function Messages({ user }) {
     const mapped = rows.map((row) => {
       const category = normalizeCategory(row.category)
       const status = normalizeStatus(row)
-      const voteCount = typeof row.vote_count === 'number' ? row.vote_count : (voteMap[row.id] || 0)
-      const replyCount = typeof row.reply_count === 'number' ? row.reply_count : ((replyMap[row.id] || []).length)
+      const hasRealtimeVoteCount = Object.prototype.hasOwnProperty.call(voteMap, row.id)
+      const hasRealtimeReplyCount = Object.prototype.hasOwnProperty.call(replyMap, row.id)
+      const voteCount = hasRealtimeVoteCount
+        ? voteMap[row.id]
+        : (typeof row.vote_count === 'number' ? row.vote_count : 0)
+      const replyCount = hasRealtimeReplyCount
+        ? (replyMap[row.id] || []).length
+        : (typeof row.reply_count === 'number' ? row.reply_count : 0)
 
       return {
         id: row.id,
@@ -656,23 +662,6 @@ export default function Messages({ user }) {
 
               return (
                 <article className="mb-post-card" key={post.id}>
-                  <div className="mb-vote-col">
-                    <button
-                      type="button"
-                      className={`mb-vote-btn ${isVoted ? 'active' : ''}`}
-                      onClick={() => toggleVote(post)}
-                      aria-label={isVoted ? '取消投票' : '投票'}
-                    >
-                      <svg className="mb-vote-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M7 10v10H3V10h4z" />
-                        <path d="M7 20h9.2a2.1 2.1 0 0 0 2-1.5l1.3-5a2.1 2.1 0 0 0-2-2.6H14V6.8c0-1.1-.9-2-2-2h-.2l-3.2 5.1c-.4.6-.6 1.2-.6 1.9V20z" />
-                      </svg>
-                      <span>{isVoted ? '已投票' : '投票'}</span>
-                    </button>
-                    <strong>{post.vote_count}</strong>
-                    <small className="mb-vote-unit">票</small>
-                  </div>
-
                   <div className="mb-post-main">
                     <div className="mb-post-head">
                       <h3>{post.title}</h3>
@@ -756,6 +745,23 @@ export default function Messages({ user }) {
                         ) : null}
                       </div>
                     ) : null}
+                  </div>
+
+                  <div className="mb-vote-col">
+                    <button
+                      type="button"
+                      className={`mb-vote-btn ${isVoted ? 'active' : ''}`}
+                      onClick={() => toggleVote(post)}
+                      aria-label={isVoted ? '取消投票' : '投票'}
+                    >
+                      <svg className="mb-vote-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M7 10v10H3V10h4z" />
+                        <path d="M7 20h9.2a2.1 2.1 0 0 0 2-1.5l1.3-5a2.1 2.1 0 0 0-2-2.6H14V6.8c0-1.1-.9-2-2-2h-.2l-3.2 5.1c-.4.6-.6 1.2-.6 1.9V20z" />
+                      </svg>
+                      <span>{isVoted ? '已投票' : '投票'}</span>
+                    </button>
+                    <strong>{post.vote_count}</strong>
+                    <small className="mb-vote-unit">票</small>
                   </div>
                 </article>
               )

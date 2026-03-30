@@ -1587,16 +1587,16 @@ button.nav-cta {
   background: #fff;
   padding: 18px 16px;
   display: grid;
-  grid-template-columns: 54px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 96px;
   gap: 16px;
 }
 
 .mb-vote-col {
   display: grid;
-  justify-items: center;
+  justify-items: end;
   align-content: start;
   gap: 10px;
-  text-align: center;
+  text-align: right;
 }
 
 .mb-vote-btn {
@@ -3691,7 +3691,7 @@ button.nav-cta {
   .mb-search input { min-width: 0; width: 100%; }
   .mb-filter-right select { width: 100%; }
   .mb-post-card { grid-template-columns: 1fr; }
-  .mb-vote-col { grid-template-columns: auto auto auto; justify-content: start; align-items: center; }
+  .mb-vote-col { grid-template-columns: auto auto auto; justify-content: end; align-items: center; }
   .mb-post-head h3 { font-size: 22px; }
   .mb-post-content { font-size: 16px; }
   .admin-message-head,
