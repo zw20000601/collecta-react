@@ -1,4 +1,5 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+﻿import { useEffect, useMemo, useRef, useState } from 'react'
+import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 import { notifyError, notifyInfo, notifySuccess } from '../lib/notify'
@@ -33,8 +34,7 @@ const FILTER_TABS = [
 ]
 
 const PRIORITY_COLUMNS_MISSING_REGEX = /column\s+messages\.(yesterday_vote_count|priority_date)\s+does\s+not\s+exist/i
-const MESSAGE_CACHE_PREFIX = 'collecta:messages:v2'
-const MESSAGE_REFRESH_DEBOUNCE_MS = 420
+const TITLE_COLUMN_MISSING_REGEX = /column\s+messages\.title\s+does\s+not\s+exist/i
 
 function normalizeCategory(value) {
   if (value && CATEGORY_META[value]) return value
@@ -77,20 +77,163 @@ function shouldShowPost(post, tab, keyword) {
   return text.includes(keyword.toLowerCase())
 }
 
+function mergeRepliesByPost(pages) {
+  return (pages || []).reduce((acc, page) => {
+    const map = page && page.repliesByPost && typeof page.repliesByPost === 'object' ? page.repliesByPost : {}
+    Object.keys(map).forEach((postId) => {
+      const list = Array.isArray(map[postId]) ? map[postId] : []
+      acc[postId] = list
+    })
+    return acc
+  }, {})
+}
+
+async function fetchMessagesPage({ pageParam = 0, queryKey }) {
+  const [, payload] = queryKey
+  const activeTab = payload && payload.tab ? payload.tab : 'all'
+  const sortBy = payload && payload.sort ? payload.sort : 'latest'
+  const keyword = payload && payload.keyword ? payload.keyword : ''
+  const userId = payload && payload.userId ? payload.userId : ''
+
+  const from = pageParam * PAGE_SIZE
+  const to = from + PAGE_SIZE - 1
+
+  function buildQuery(enableDailyPriority) {
+    let query = supabase
+      .from('messages')
+      .select('id,user_id,title,content,category,status,is_done,created_at,vote_count,reply_count')
+
+    if (activeTab !== 'all') {
+      query = query.eq('category', activeTab)
+    }
+
+    if (sortBy === 'votes') {
+      query = query.order('vote_count', { ascending: false }).order('created_at', { ascending: false })
+    } else if (sortBy === 'pending') {
+      query = query.eq('status', 'pending').order('created_at', { ascending: false })
+    } else if (enableDailyPriority) {
+      query = query.order('yesterday_vote_count', { ascending: false }).order('created_at', { ascending: false })
+    } else {
+      query = query.order('created_at', { ascending: false })
+    }
+
+    if (keyword.trim()) {
+      const safe = keyword.trim().replaceAll(',', ' ').replaceAll('%', ' ')
+      query = query.or(`title.ilike.%${safe}%,content.ilike.%${safe}%`)
+    }
+
+    return query.range(from, to)
+  }
+
+  let usedPriorityFallback = false
+  let { data: rows, error } = await buildQuery(true)
+
+  if (error && PRIORITY_COLUMNS_MISSING_REGEX.test(String(error.message || ''))) {
+    usedPriorityFallback = true
+    const fallback = await buildQuery(false)
+    rows = fallback.data
+    error = fallback.error
+  }
+
+  if (error) {
+    if (TITLE_COLUMN_MISSING_REGEX.test(String(error.message || ''))) {
+      return {
+        posts: [],
+        repliesByPost: {},
+        votedIds: [],
+        hasMore: false,
+        schemaUnsupported: true,
+        priorityFallback: false,
+      }
+    }
+    throw new Error(error.message || '读取留言失败')
+  }
+
+  const dataRows = rows || []
+  const postIds = dataRows.map((row) => row.id)
+
+  let voteMap = {}
+  let replyMap = {}
+  let votedIds = []
+
+  if (postIds.length) {
+    const [votesRes, repliesRes, userVotesRes] = await Promise.all([
+      supabase.from('message_votes').select('post_id').in('post_id', postIds),
+      supabase
+        .from('message_replies')
+        .select('id,post_id,user_id,content,is_official,created_at')
+        .in('post_id', postIds)
+        .order('created_at', { ascending: true }),
+      userId
+        ? supabase.from('message_votes').select('post_id').eq('user_id', userId).in('post_id', postIds)
+        : Promise.resolve({ data: [], error: null }),
+    ])
+
+    if (votesRes.error) {
+      throw new Error(votesRes.error.message || '投票数据读取失败')
+    }
+    if (repliesRes.error) {
+      throw new Error(repliesRes.error.message || '回复数据读取失败')
+    }
+
+    voteMap = (votesRes.data || []).reduce((acc, item) => {
+      const key = item.post_id
+      acc[key] = (acc[key] || 0) + 1
+      return acc
+    }, {})
+
+    replyMap = (repliesRes.data || []).reduce((acc, item) => {
+      if (!acc[item.post_id]) acc[item.post_id] = []
+      acc[item.post_id].push(item)
+      return acc
+    }, {})
+
+    if (!userVotesRes.error) {
+      votedIds = (userVotesRes.data || []).map((item) => item.post_id)
+    }
+  }
+
+  const mappedPosts = dataRows.map((row) => {
+    const hasRealtimeVoteCount = Object.prototype.hasOwnProperty.call(voteMap, row.id)
+    const hasRealtimeReplyCount = Object.prototype.hasOwnProperty.call(replyMap, row.id)
+    const voteCount = hasRealtimeVoteCount
+      ? voteMap[row.id]
+      : (typeof row.vote_count === 'number' ? row.vote_count : 0)
+    const replyCount = hasRealtimeReplyCount
+      ? (replyMap[row.id] || []).length
+      : (typeof row.reply_count === 'number' ? row.reply_count : 0)
+
+    return {
+      id: row.id,
+      user_id: row.user_id,
+      title: String(row.title || row.content || '未命名留言').trim().slice(0, 80),
+      content: String(row.content || '').trim(),
+      category: normalizeCategory(row.category),
+      status: normalizeStatus(row),
+      vote_count: Math.max(0, voteCount),
+      reply_count: Math.max(0, replyCount),
+      created_at: row.created_at,
+    }
+  })
+
+  return {
+    posts: mappedPosts,
+    repliesByPost: replyMap,
+    votedIds,
+    hasMore: dataRows.length === PAGE_SIZE,
+    schemaUnsupported: false,
+    priorityFallback: usedPriorityFallback,
+  }
+}
+
 export default function Messages({ user }) {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
 
   const activeTab = parseTab(searchParams.get('category'))
   const sortBy = parseSort(searchParams.get('sort'))
   const keyword = String(searchParams.get('keyword') || '')
-  const cacheKey = `${MESSAGE_CACHE_PREFIX}:${activeTab}:${sortBy}:${keyword.trim().toLowerCase()}`
-
-  const [posts, setPosts] = useState([])
-  const [postsStatus, setPostsStatus] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [loadingMore, setLoadingMore] = useState(false)
-  const [hasMore, setHasMore] = useState(true)
 
   const [formTitle, setFormTitle] = useState('')
   const [formContent, setFormContent] = useState('')
@@ -98,19 +241,118 @@ export default function Messages({ user }) {
   const [formStatus, setFormStatus] = useState('')
   const [submittingPost, setSubmittingPost] = useState(false)
 
-  const [votedSet, setVotedSet] = useState(new Set())
-  const [repliesByPost, setRepliesByPost] = useState({})
   const [expandedSet, setExpandedSet] = useState(new Set())
   const [replyDrafts, setReplyDrafts] = useState({})
   const [replySubmittingPostId, setReplySubmittingPostId] = useState('')
 
-  const pageRef = useRef(0)
-  const loadingRef = useRef(false)
   const sentinelRef = useRef(null)
-  const schemaErrorNotifiedRef = useRef(false)
-  const schemaUnsupportedRef = useRef(false)
   const priorityFallbackNotifiedRef = useRef(false)
-  const refreshTimerRef = useRef(null)
+
+  const messageQueryKey = useMemo(
+    () => [
+      'messages_feed',
+      {
+        tab: activeTab,
+        sort: sortBy,
+        keyword: keyword.trim(),
+        userId: user ? user.id : '',
+      },
+    ],
+    [activeTab, sortBy, keyword, user],
+  )
+
+  const messagesQuery = useInfiniteQuery({
+    queryKey: messageQueryKey,
+    queryFn: fetchMessagesPage,
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, pages) => (lastPage && lastPage.hasMore ? pages.length : undefined),
+    placeholderData: (prev) => prev,
+  })
+
+  const pages = messagesQuery.data && Array.isArray(messagesQuery.data.pages) ? messagesQuery.data.pages : []
+
+  const schemaUnsupported = useMemo(
+    () => pages.some((page) => page && page.schemaUnsupported),
+    [pages],
+  )
+
+  const posts = useMemo(
+    () => pages.flatMap((page) => (page && Array.isArray(page.posts) ? page.posts : [])),
+    [pages],
+  )
+
+  const repliesByPost = useMemo(() => mergeRepliesByPost(pages), [pages])
+
+  const votedSet = useMemo(() => {
+    const set = new Set()
+    pages.forEach((page) => {
+      const list = page && Array.isArray(page.votedIds) ? page.votedIds : []
+      list.forEach((id) => set.add(id))
+    })
+    return set
+  }, [pages])
+
+  const postsWithOfficialReply = useMemo(() => {
+    return posts.map((post) => {
+      const replies = repliesByPost[post.id] || []
+      const officialReply = replies.find((item) => item.is_official)
+      return { ...post, replies, officialReply }
+    })
+  }, [posts, repliesByPost])
+
+  const loading = messagesQuery.isLoading
+  const loadingMore = messagesQuery.isFetchingNextPage
+  const hasMore = Boolean(messagesQuery.hasNextPage)
+
+  useEffect(() => {
+    if (!messagesQuery.error) return
+    notifyError(`读取留言失败：${messagesQuery.error.message}`)
+  }, [messagesQuery.error])
+
+  useEffect(() => {
+    if (!pages.length) return
+    const hasPriorityFallback = pages.some((page) => page && page.priorityFallback)
+    if (!hasPriorityFallback || priorityFallbackNotifiedRef.current) return
+    notifyInfo('当前数据库尚未启用“昨日高票优先”，已自动按最新发布显示。')
+    priorityFallbackNotifiedRef.current = true
+  }, [pages])
+
+  useEffect(() => {
+    const channel = supabase
+      .channel('messages-live-sync')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => {
+        queryClient.invalidateQueries({ queryKey: ['messages_feed'] })
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_replies' }, () => {
+        queryClient.invalidateQueries({ queryKey: ['messages_feed'] })
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'message_votes' }, () => {
+        queryClient.invalidateQueries({ queryKey: ['messages_feed'] })
+      })
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(channel)
+    }
+  }, [queryClient])
+
+  useEffect(() => {
+    if (!hasMore || loading || loadingMore) return
+    const node = sentinelRef.current
+    if (!node) return
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0] && entries[0].isIntersecting) {
+          messagesQuery.fetchNextPage()
+        }
+      },
+      { rootMargin: '280px 0px' },
+    )
+
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [hasMore, loading, loadingMore, messagesQuery])
 
   function updateQuery(next) {
     const params = new URLSearchParams(searchParams)
@@ -134,290 +376,13 @@ export default function Messages({ user }) {
     setSearchParams(params, { replace: true })
   }
 
-  const loadPosts = useCallback(async (reset) => {
-    if (schemaUnsupportedRef.current) return
-    if (loadingRef.current) return
-    loadingRef.current = true
-
-    if (reset) {
-      pageRef.current = 0
-      setHasMore(true)
-      setLoading(!posts.length)
-      setPostsStatus('')
-    } else {
-      setLoadingMore(true)
-    }
-
-    const from = pageRef.current * PAGE_SIZE
-    const to = from + PAGE_SIZE - 1
-
-    function buildQuery(enableDailyPriority) {
-      let query = supabase
-        .from('messages')
-        .select('id,user_id,title,content,category,status,is_done,created_at,vote_count,reply_count')
-
-      if (activeTab !== 'all') {
-        query = query.eq('category', activeTab)
-      }
-
-      if (sortBy === 'votes') {
-        query = query.order('vote_count', { ascending: false }).order('created_at', { ascending: false })
-      } else if (sortBy === 'pending') {
-        query = query.eq('status', 'pending').order('created_at', { ascending: false })
-      } else if (enableDailyPriority) {
-        // 默认排序: 每天优先展示“昨日高票”留言，再按发布时间排序
-        query = query
-          .order('yesterday_vote_count', { ascending: false })
-          .order('created_at', { ascending: false })
-      } else {
-        query = query.order('created_at', { ascending: false })
-      }
-
-      if (keyword.trim()) {
-        const safe = keyword.trim().replaceAll(',', ' ').replaceAll('%', ' ')
-        query = query.or(`title.ilike.%${safe}%,content.ilike.%${safe}%`)
-      }
-
-      return query.range(from, to)
-    }
-
-    let { data, error } = await buildQuery(true)
-
-    if (error && PRIORITY_COLUMNS_MISSING_REGEX.test(String(error.message || ''))) {
-      // 兼容: 如果你还没执行新增字段 SQL, 自动回退到“最新发布”
-      const fallback = await buildQuery(false)
-      data = fallback.data
-      error = fallback.error
-      if (!fallback.error && !priorityFallbackNotifiedRef.current) {
-        notifyInfo('当前数据库尚未启用“昨日高票优先”，已自动按最新发布显示。')
-        priorityFallbackNotifiedRef.current = true
-      }
-    }
-
-    if (error) {
-      const rawMessage = String(error.message || '')
-      const isMissingTitleColumn = /column\s+messages\.title\s+does\s+not\s+exist/i.test(rawMessage)
-
-      if (isMissingTitleColumn) {
-        schemaUnsupportedRef.current = true
-        setHasMore(false)
-        setPostsStatus('数据库 messages 表缺少留言板新字段（title/category/status/vote_count/reply_count）。请先执行 supabase.sql 里的迁移 SQL。')
-        if (!schemaErrorNotifiedRef.current) {
-          notifyError('留言板数据库未升级：messages.title 不存在，请先执行迁移 SQL')
-          schemaErrorNotifiedRef.current = true
-        }
-      } else {
-        const msg = `读取留言失败：${rawMessage}`
-        setPostsStatus(msg)
-        notifyError(msg)
-        setHasMore(false)
-      }
-
-      if (reset) setPosts([])
-      setLoading(false)
-      setLoadingMore(false)
-      loadingRef.current = false
-      return
-    }
-
-    const rows = data || []
-    const postIds = rows.map((row) => row.id)
-
-    let voteMap = {}
-    let replyMap = {}
-    let userVotes = []
-
-    if (postIds.length) {
-      const [votesRes, repliesRes, userVoteRes] = await Promise.all([
-        supabase.from('message_votes').select('post_id').in('post_id', postIds),
-        supabase
-          .from('message_replies')
-          .select('id,post_id,user_id,content,is_official,created_at')
-          .in('post_id', postIds)
-          .order('created_at', { ascending: true }),
-        user
-          ? supabase.from('message_votes').select('post_id').eq('user_id', user.id).in('post_id', postIds)
-          : Promise.resolve({ data: [], error: null }),
-      ])
-
-      if (votesRes.error) {
-        notifyError(`投票数据读取失败：${votesRes.error.message}`)
-      } else {
-        voteMap = (votesRes.data || []).reduce((acc, item) => {
-          const key = item.post_id
-          acc[key] = (acc[key] || 0) + 1
-          return acc
-        }, {})
-      }
-
-      if (repliesRes.error) {
-        notifyError(`回复数据读取失败：${repliesRes.error.message}`)
-      } else {
-        replyMap = (repliesRes.data || []).reduce((acc, item) => {
-          if (!acc[item.post_id]) acc[item.post_id] = []
-          acc[item.post_id].push(item)
-          return acc
-        }, {})
-      }
-
-      if (userVoteRes && !userVoteRes.error) {
-        userVotes = (userVoteRes.data || []).map((item) => item.post_id)
-      }
-    }
-
-    const mapped = rows.map((row) => {
-      const category = normalizeCategory(row.category)
-      const status = normalizeStatus(row)
-      const hasRealtimeVoteCount = Object.prototype.hasOwnProperty.call(voteMap, row.id)
-      const hasRealtimeReplyCount = Object.prototype.hasOwnProperty.call(replyMap, row.id)
-      const voteCount = hasRealtimeVoteCount
-        ? voteMap[row.id]
-        : (typeof row.vote_count === 'number' ? row.vote_count : 0)
-      const replyCount = hasRealtimeReplyCount
-        ? (replyMap[row.id] || []).length
-        : (typeof row.reply_count === 'number' ? row.reply_count : 0)
-
-      return {
-        id: row.id,
-        user_id: row.user_id,
-        title: String(row.title || row.content || '未命名留言').trim().slice(0, 80),
-        content: String(row.content || '').trim(),
-        category,
-        status,
-        vote_count: Math.max(0, voteCount),
-        reply_count: Math.max(0, replyCount),
-        created_at: row.created_at,
-      }
+  function patchMessageCache(patchFn) {
+    queryClient.setQueryData(messageQueryKey, (old) => {
+      if (!old || !Array.isArray(old.pages)) return old
+      const nextPages = old.pages.map((page) => patchFn(page))
+      return { ...old, pages: nextPages }
     })
-
-    setRepliesByPost((prev) => ({ ...prev, ...replyMap }))
-    if (userVotes.length) {
-      setVotedSet((prev) => {
-        const next = new Set(prev)
-        userVotes.forEach((id) => next.add(id))
-        return next
-      })
-    }
-
-    let mergedPosts = mapped
-    setPosts((prev) => {
-      if (reset) return mapped
-      const exists = new Set(prev.map((item) => item.id))
-      const append = mapped.filter((item) => !exists.has(item.id))
-      mergedPosts = [...prev, ...append]
-      return mergedPosts
-    })
-
-    if (reset) {
-      const cachePayload = {
-        cachedAt: Date.now(),
-        posts: mapped,
-      }
-      sessionStorage.setItem(cacheKey, JSON.stringify(cachePayload))
-    } else {
-      const cachePayload = {
-        cachedAt: Date.now(),
-        posts: mergedPosts,
-      }
-      sessionStorage.setItem(cacheKey, JSON.stringify(cachePayload))
-    }
-
-    if (rows.length < PAGE_SIZE) {
-      setHasMore(false)
-    } else {
-      pageRef.current += 1
-      setHasMore(true)
-    }
-
-    setLoading(false)
-    setLoadingMore(false)
-    loadingRef.current = false
-  }, [activeTab, sortBy, keyword, user, posts.length, cacheKey])
-
-  const scheduleRefresh = useCallback((reset) => {
-    if (refreshTimerRef.current) {
-      window.clearTimeout(refreshTimerRef.current)
-    }
-    refreshTimerRef.current = window.setTimeout(() => {
-      refreshTimerRef.current = null
-      loadPosts(reset)
-    }, MESSAGE_REFRESH_DEBOUNCE_MS)
-  }, [loadPosts])
-
-  useEffect(() => {
-    const raw = sessionStorage.getItem(cacheKey)
-    if (!raw) return
-
-    try {
-      const parsed = JSON.parse(raw)
-      const cachedPosts = Array.isArray(parsed && parsed.posts) ? parsed.posts : []
-      if (!cachedPosts.length) return
-
-      setPosts(cachedPosts)
-      setLoading(false)
-      setHasMore(true)
-      setPostsStatus('已加载缓存，正在同步最新留言...')
-    } catch (_error) {
-      sessionStorage.removeItem(cacheKey)
-    }
-  }, [cacheKey])
-
-  useEffect(() => {
-    scheduleRefresh(true)
-    return () => {
-      if (refreshTimerRef.current) {
-        window.clearTimeout(refreshTimerRef.current)
-        refreshTimerRef.current = null
-      }
-    }
-  }, [scheduleRefresh])
-
-  useEffect(() => {
-    const channel = supabase
-      .channel('messages-live-sync')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'messages' },
-        () => scheduleRefresh(true),
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'message_replies' },
-        () => scheduleRefresh(true),
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'message_votes' },
-        () => scheduleRefresh(true),
-      )
-      .subscribe()
-
-    return () => {
-      if (refreshTimerRef.current) {
-        window.clearTimeout(refreshTimerRef.current)
-        refreshTimerRef.current = null
-      }
-      supabase.removeChannel(channel)
-    }
-  }, [scheduleRefresh])
-
-  useEffect(() => {
-    if (!hasMore || loading || loadingMore) return
-    const node = sentinelRef.current
-    if (!node) return
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries[0] && entries[0].isIntersecting) {
-          scheduleRefresh(false)
-        }
-      },
-      { rootMargin: '280px 0px' },
-    )
-
-    observer.observe(node)
-    return () => observer.disconnect()
-  }, [hasMore, loading, loadingMore, scheduleRefresh])
+  }
 
   function toggleExpand(postId) {
     setExpandedSet((prev) => {
@@ -493,8 +458,31 @@ export default function Messages({ user }) {
     notifySuccess('留言已发布')
 
     if (shouldShowPost(created, activeTab, keyword)) {
-      setPosts((prev) => [created, ...prev])
+      queryClient.setQueryData(messageQueryKey, (old) => {
+        if (!old || !Array.isArray(old.pages) || !old.pages.length) {
+          return {
+            pages: [{ posts: [created], repliesByPost: {}, votedIds: [], hasMore: false, schemaUnsupported: false, priorityFallback: false }],
+            pageParams: [0],
+          }
+        }
+
+        const first = old.pages[0]
+        const firstPosts = Array.isArray(first.posts) ? first.posts : []
+        if (firstPosts.some((item) => item.id === created.id)) return old
+
+        const nextFirst = {
+          ...first,
+          posts: [created, ...firstPosts],
+        }
+
+        return {
+          ...old,
+          pages: [nextFirst, ...old.pages.slice(1)],
+        }
+      })
     }
+
+    queryClient.invalidateQueries({ queryKey: ['messages_feed'] })
   }
 
   async function toggleVote(post) {
@@ -506,18 +494,24 @@ export default function Messages({ user }) {
 
     const alreadyVoted = votedSet.has(post.id)
 
-    setVotedSet((prev) => {
-      const next = new Set(prev)
-      if (alreadyVoted) next.delete(post.id)
-      else next.add(post.id)
-      return next
-    })
+    patchMessageCache((page) => {
+      const postsInPage = page && Array.isArray(page.posts) ? page.posts : []
+      if (!postsInPage.some((item) => item.id === post.id)) return page
 
-    setPosts((prev) => prev.map((item) => {
-      if (item.id !== post.id) return item
-      const nextVotes = Math.max(0, item.vote_count + (alreadyVoted ? -1 : 1))
-      return { ...item, vote_count: nextVotes }
-    }))
+      const votedIds = Array.isArray(page.votedIds) ? [...page.votedIds] : []
+      const votedSetInner = new Set(votedIds)
+      if (alreadyVoted) votedSetInner.delete(post.id)
+      else votedSetInner.add(post.id)
+
+      return {
+        ...page,
+        posts: postsInPage.map((item) => {
+          if (item.id !== post.id) return item
+          return { ...item, vote_count: Math.max(0, item.vote_count + (alreadyVoted ? -1 : 1)) }
+        }),
+        votedIds: Array.from(votedSetInner),
+      }
+    })
 
     let opError = null
 
@@ -539,20 +533,8 @@ export default function Messages({ user }) {
 
     if (!opError) return
 
-    setVotedSet((prev) => {
-      const next = new Set(prev)
-      if (alreadyVoted) next.add(post.id)
-      else next.delete(post.id)
-      return next
-    })
-
-    setPosts((prev) => prev.map((item) => {
-      if (item.id !== post.id) return item
-      const rollbackVotes = Math.max(0, item.vote_count + (alreadyVoted ? 1 : -1))
-      return { ...item, vote_count: rollbackVotes }
-    }))
-
     notifyError(`投票失败：${opError.message}`)
+    queryClient.invalidateQueries({ queryKey: messageQueryKey })
   }
 
   async function submitReply(post) {
@@ -588,15 +570,25 @@ export default function Messages({ user }) {
       return
     }
 
-    setRepliesByPost((prev) => {
-      const list = prev[post.id] || []
-      return { ...prev, [post.id]: [...list, data] }
-    })
+    patchMessageCache((page) => {
+      const postsInPage = page && Array.isArray(page.posts) ? page.posts : []
+      if (!postsInPage.some((item) => item.id === post.id)) return page
 
-    setPosts((prev) => prev.map((item) => {
-      if (item.id !== post.id) return item
-      return { ...item, reply_count: item.reply_count + 1 }
-    }))
+      const currentRepliesMap = page.repliesByPost && typeof page.repliesByPost === 'object' ? page.repliesByPost : {}
+      const currentList = Array.isArray(currentRepliesMap[post.id]) ? currentRepliesMap[post.id] : []
+
+      return {
+        ...page,
+        posts: postsInPage.map((item) => {
+          if (item.id !== post.id) return item
+          return { ...item, reply_count: item.reply_count + 1 }
+        }),
+        repliesByPost: {
+          ...currentRepliesMap,
+          [post.id]: [...currentList, data],
+        },
+      }
+    })
 
     setReplyDrafts((prev) => ({ ...prev, [post.id]: '' }))
     setExpandedSet((prev) => {
@@ -608,13 +600,13 @@ export default function Messages({ user }) {
     notifySuccess('回复已发布')
   }
 
-  const postsWithOfficialReply = useMemo(() => {
-    return posts.map((post) => {
-      const replies = repliesByPost[post.id] || []
-      const officialReply = replies.find((item) => item.is_official)
-      return { ...post, replies, officialReply }
-    })
-  }, [posts, repliesByPost])
+  const postsStatus = schemaUnsupported
+    ? '数据库 messages 表缺少留言板新字段（title/category/status/vote_count/reply_count）。请先执行 supabase.sql 里的迁移 SQL。'
+    : messagesQuery.error
+    ? `读取留言失败：${messagesQuery.error.message}`
+    : messagesQuery.isFetching && !loading
+    ? '正在同步最新留言...'
+    : ''
 
   return (
     <main className="page messages-v2-page">
@@ -835,3 +827,4 @@ export default function Messages({ user }) {
     </main>
   )
 }
+

@@ -1,5 +1,6 @@
-﻿import { useCallback, useEffect, useState } from 'react'
+﻿import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { supabase } from '../lib/supabase'
 import HeroClouds from '../components/HeroClouds'
 
@@ -57,47 +58,62 @@ const FEATURE_ITEMS = [
   },
 ]
 
+async function fetchHomeStats() {
+  let resourcesRes = await supabase
+    .from('resources')
+    .select('*', { count: 'exact', head: true })
+    .eq('is_public', true)
+
+  if (resourcesRes.error && /column .*is_public/i.test(String(resourcesRes.error.message || ''))) {
+    resourcesRes = await supabase
+      .from('resources')
+      .select('*', { count: 'exact', head: true })
+      .eq('public', true)
+  }
+
+  const [usersRes, messagesRes] = await Promise.all([
+    supabase.from('profiles').select('*', { count: 'exact', head: true }),
+    supabase.from('messages').select('*', { count: 'exact', head: true }),
+  ])
+
+  return {
+    resources: typeof resourcesRes.count === 'number' ? resourcesRes.count : 0,
+    users: typeof usersRes.count === 'number' ? usersRes.count : 0,
+    messages: typeof messagesRes.count === 'number' ? messagesRes.count : 0,
+  }
+}
+
 export default function Home({ user, isGuest }) {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const [query, setQuery] = useState('')
-  const [stats, setStats] = useState({ resources: 0, users: 0, messages: 0 })
-  const [statsReady, setStatsReady] = useState(false)
 
-  const loadStats = useCallback(async () => {
-    let resourcesRes = await supabase.from('resources').select('*', { count: 'exact', head: true }).eq('is_public', true)
-    if (resourcesRes.error && /column .*is_public/i.test(String(resourcesRes.error.message || ''))) {
-      resourcesRes = await supabase.from('resources').select('*', { count: 'exact', head: true }).eq('public', true)
-    }
+  const statsQuery = useQuery({
+    queryKey: ['home_stats_summary'],
+    queryFn: fetchHomeStats,
+  })
 
-    const [usersRes, messagesRes] = await Promise.all([
-      supabase.from('profiles').select('*', { count: 'exact', head: true }),
-      supabase.from('messages').select('*', { count: 'exact', head: true }),
-    ])
-
-    setStats({
-      resources: typeof resourcesRes.count === 'number' ? resourcesRes.count : 0,
-      users: typeof usersRes.count === 'number' ? usersRes.count : 0,
-      messages: typeof messagesRes.count === 'number' ? messagesRes.count : 0,
-    })
-    setStatsReady(true)
-  }, [])
-
-  useEffect(() => {
-    loadStats()
-  }, [loadStats])
+  const stats = statsQuery.data || { resources: 0, users: 0, messages: 0 }
+  const statsReady = !statsQuery.isLoading
 
   useEffect(() => {
     const channel = supabase
       .channel('home-stats-sync')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'resources' }, loadStats)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, loadStats)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, loadStats)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'resources' }, () => {
+        queryClient.invalidateQueries({ queryKey: ['home_stats_summary'] })
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => {
+        queryClient.invalidateQueries({ queryKey: ['home_stats_summary'] })
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, () => {
+        queryClient.invalidateQueries({ queryKey: ['home_stats_summary'] })
+      })
       .subscribe()
 
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [loadStats])
+  }, [queryClient])
 
   function onSearch(event) {
     event.preventDefault()

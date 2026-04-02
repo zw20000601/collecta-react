@@ -1,12 +1,11 @@
 ﻿import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { supabase } from '../lib/supabase'
 import { notifyError, notifySuccess } from '../lib/notify'
 import { normalizeResource } from '../lib/resourceUtils'
 import ResourceCard from '../components/ResourceCard'
 import HeroClouds from '../components/HeroClouds'
-
-const FAVORITES_CACHE_PREFIX = 'collecta:favorites:v2'
 
 function normalizeText(value) {
   return String(value || '').trim().toLowerCase()
@@ -18,82 +17,77 @@ function tagsToText(tags) {
   return ''
 }
 
-export default function Favorites({ user }) {
-  const [resources, setResources] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [status, setStatus] = useState('加载中...')
+async function fetchFavorites(userId) {
+  if (!userId) return []
 
+  const { data: rows, error } = await supabase
+    .from('favorites')
+    .select(`
+      id,
+      resource_id,
+      created_at,
+      resource:resources(*)
+    `)
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+
+  if (error) {
+    throw new Error(error.message || '读取收藏失败')
+  }
+
+  return (rows || [])
+    .map((item) => normalizeResource(item && item.resource))
+    .filter(Boolean)
+}
+
+export default function Favorites({ user }) {
+  const queryClient = useQueryClient()
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState('all')
   const [sortBy, setSortBy] = useState('latest')
-  const cacheKey = `${FAVORITES_CACHE_PREFIX}:${user ? user.id : 'guest'}`
+
+  const userId = user ? user.id : ''
+
+  const favoritesQuery = useQuery({
+    queryKey: ['favorites', userId],
+    queryFn: () => fetchFavorites(userId),
+    enabled: Boolean(userId),
+    placeholderData: (prev) => prev,
+  })
+
+  const resources = favoritesQuery.data || []
+  const loading = favoritesQuery.isLoading
 
   useEffect(() => {
-    if (!user) return
-    const raw = sessionStorage.getItem(cacheKey)
-    if (!raw) return
-    try {
-      const parsed = JSON.parse(raw)
-      const cached = Array.isArray(parsed && parsed.resources) ? parsed.resources : []
-      if (!cached.length) return
-      setResources(cached)
-      setLoading(false)
-      setStatus('已加载缓存，正在同步收藏...')
-    } catch (_error) {
-      sessionStorage.removeItem(cacheKey)
-    }
-  }, [user, cacheKey])
+    if (!favoritesQuery.error) return
+    notifyError(`读取收藏失败：${favoritesQuery.error.message}`)
+  }, [favoritesQuery.error])
 
   useEffect(() => {
-    if (user) loadFavorites()
-  }, [user])
+    if (!userId) return undefined
 
-  async function loadFavorites() {
-    if (!resources.length) setLoading(true)
+    const channel = supabase
+      .channel(`favorites-sync-${userId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'favorites' }, () => {
+        queryClient.invalidateQueries({ queryKey: ['favorites', userId] })
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'resources' }, () => {
+        queryClient.invalidateQueries({ queryKey: ['favorites', userId] })
+      })
+      .subscribe()
 
-    const { data: rows, error: favError } = await supabase
-      .from('favorites')
-      .select(`
-        id,
-        resource_id,
-        created_at,
-        resource:resources(*)
-      `)
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: false })
-
-    if (favError) {
-      const msg = `读取收藏失败：${favError.message}`
-      setStatus(msg)
-      notifyError(msg)
-      setResources([])
-      setLoading(false)
-      return
+    return () => {
+      supabase.removeChannel(channel)
     }
-
-    const normalizedFromJoin = (rows || [])
-      .map((item) => normalizeResource(item && item.resource))
-      .filter(Boolean)
-
-    if (!normalizedFromJoin.length) {
-      setResources([])
-      setStatus('还没有收藏资源')
-      setLoading(false)
-      sessionStorage.setItem(cacheKey, JSON.stringify({ cachedAt: Date.now(), resources: [] }))
-      return
-    }
-
-    setResources(normalizedFromJoin)
-    sessionStorage.setItem(cacheKey, JSON.stringify({ cachedAt: Date.now(), resources: normalizedFromJoin }))
-    setStatus('收藏已同步')
-    setLoading(false)
-  }
+  }, [queryClient, userId])
 
   async function removeFavorite(resource) {
+    if (!userId) return
+
     const { error } = await supabase
       .from('favorites')
       .delete()
-      .eq('user_id', user.id)
+      .eq('user_id', userId)
       .eq('resource_id', resource.id)
 
     if (error) {
@@ -101,18 +95,11 @@ export default function Favorites({ user }) {
       return
     }
 
-    setResources((prev) => {
-      const next = prev.filter((item) => item.id !== resource.id)
-      sessionStorage.setItem(
-        cacheKey,
-        JSON.stringify({
-          cachedAt: Date.now(),
-          resources: next,
-        }),
-      )
-      return next
+    queryClient.setQueryData(['favorites', userId], (prev) => {
+      const list = Array.isArray(prev) ? prev : []
+      return list.filter((item) => item.id !== resource.id)
     })
-    setStatus('已取消收藏')
+    queryClient.invalidateQueries({ queryKey: ['favorites_stats_by_category', userId] })
     notifySuccess('已取消收藏')
   }
 
@@ -153,6 +140,14 @@ export default function Favorites({ user }) {
     setCategory('all')
     setSortBy('latest')
   }
+
+  const status = loading
+    ? '加载中...'
+    : favoritesQuery.isFetching
+    ? '正在同步收藏...'
+    : resources.length
+    ? '收藏已同步'
+    : '还没有收藏资源'
 
   return (
     <main className="page">

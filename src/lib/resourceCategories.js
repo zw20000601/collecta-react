@@ -1,4 +1,4 @@
-export const DEFAULT_RESOURCE_CATEGORIES = [
+﻿export const DEFAULT_RESOURCE_CATEGORIES = [
   { id: 'default-article', name: '文章', emoji: '📚', sort_order: 10 },
   { id: 'default-video', name: '视频', emoji: '🎬', sort_order: 20 },
   { id: 'default-tool', name: '工具', emoji: '🛠️', sort_order: 30 },
@@ -27,4 +27,3 @@ export function getDefaultCategoryName(rows) {
   const list = withFallbackCategories(rows)
   return (list[0] && list[0].name) || '工具'
 }
-

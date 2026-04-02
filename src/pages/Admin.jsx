@@ -1,10 +1,11 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { supabase } from '../lib/supabase'
 import { notifyError, notifyInfo, notifySuccess } from '../lib/notify'
 import { createResourceSlug, normalizeResource, normalizeTags } from '../lib/resourceUtils'
-import { DEFAULT_RESOURCE_CATEGORIES, getDefaultCategoryName } from '../lib/resourceCategories'
+import { getDefaultCategoryName } from '../lib/resourceCategories'
 import CategoryIcon from '../components/CategoryIcon'
 
 const ADMIN_MENU = [
@@ -157,11 +158,12 @@ function statusLabel(status) {
 export default function Admin({ user, onLogout }) {
   const location = useLocation()
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const section = activeSectionFromPath(location.pathname)
 
   const [stats, setStats] = useState({ resources: 0, messages: 0, pending: 0, users: 0 })
   const [resources, setResources] = useState([])
-  const [resourceCategories, setResourceCategories] = useState(DEFAULT_RESOURCE_CATEGORIES)
+  const [resourceCategories, setResourceCategories] = useState([])
   const [messages, setMessages] = useState([])
   const [repliesByPost, setRepliesByPost] = useState({})
   const [users, setUsers] = useState([])
@@ -195,110 +197,174 @@ export default function Admin({ user, onLogout }) {
     }
   }, [location.pathname, navigate])
 
-  useEffect(() => {
-    refreshAll()
-  }, [])
-
   function addLog(type, target) {
     setActionLogs((prev) => [
-      { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, created_at: new Date().toISOString(), type, target },
+      { id: Date.now().toString() + '-' + Math.random().toString(16).slice(2), created_at: new Date().toISOString(), type, target },
       ...prev,
     ])
   }
 
+  const statsQuery = useQuery({
+    queryKey: ['admin_stats'],
+    queryFn: async () => {
+      const [r, m, p, u] = await Promise.all([
+        supabase.from('resources').select('*', { count: 'exact', head: true }),
+        supabase.from('messages').select('*', { count: 'exact', head: true }),
+        supabase.from('messages').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
+        supabase.from('profiles').select('*', { count: 'exact', head: true }),
+      ])
+
+      return {
+        resources: typeof r.count === 'number' ? r.count : 0,
+        messages: typeof m.count === 'number' ? m.count : 0,
+        pending: typeof p.count === 'number' ? p.count : 0,
+        users: typeof u.count === 'number' ? u.count : 0,
+      }
+    },
+  })
+
+  const resourcesQuery = useQuery({
+    queryKey: ['admin_resources'],
+    queryFn: async () => {
+      const result = await supabase.from('resources').select('*').order('created_at', { ascending: false })
+      if (result.error) throw new Error(result.error.message || '读取资源失败')
+      return (result.data || []).map(normalizeResource)
+    },
+  })
+
+  const categoriesQuery = useQuery({
+    queryKey: ['admin_resource_categories'],
+    queryFn: async () => {
+      const result = await supabase
+        .from('resource_categories')
+        .select('id,name,emoji,sort_order,is_active,created_at')
+        .eq('is_active', true)
+        .order('sort_order', { ascending: true })
+        .order('created_at', { ascending: true })
+
+      if (result.error) throw new Error(result.error.message || '读取分类失败')
+
+      return (result.data || [])
+        .map((item) => ({
+          id: item.id,
+          name: String(item.name || '').trim(),
+          emoji: String(item.emoji || '').trim() || '📁',
+          sort_order: typeof item.sort_order === 'number' ? item.sort_order : 100,
+        }))
+        .filter((item) => item.name)
+    },
+  })
+
+  const messagesQuery = useQuery({
+    queryKey: ['admin_messages_bundle'],
+    queryFn: async () => {
+      const [m, r] = await Promise.all([
+        supabase
+          .from('messages')
+          .select('id,user_id,title,content,category,status,is_done,created_at,vote_count,reply_count')
+          .order('created_at', { ascending: false }),
+        supabase
+          .from('message_replies')
+          .select('id,post_id,user_id,content,is_official,created_at')
+          .order('created_at', { ascending: true }),
+      ])
+
+      if (m.error) throw new Error(m.error.message || '读取留言失败')
+      if (r.error) throw new Error(r.error.message || '读取回复失败')
+
+      return {
+        messages: (m.data || []).map(normalizeMessage),
+        repliesByPost: mapRepliesByPost(r.data || []),
+      }
+    },
+  })
+
+  const usersQuery = useQuery({
+    queryKey: ['admin_users'],
+    queryFn: async () => {
+      let result = await supabase
+        .from('profiles')
+        .select('id,email,role,user_role,status,account_status,disabled,created_at,inserted_at')
+        .order('created_at', { ascending: false })
+
+      if (result.error && /column .* does not exist/i.test(String(result.error.message || ''))) {
+        result = await supabase.from('profiles').select('*')
+      }
+      if (result.error) throw new Error(result.error.message || '读取用户失败')
+
+      return (result.data || []).map(mapUserRow)
+    },
+  })
+
+  useEffect(() => {
+    if (statsQuery.data) setStats(statsQuery.data)
+  }, [statsQuery.data])
+
+  useEffect(() => {
+    if (resourcesQuery.data) setResources(resourcesQuery.data)
+  }, [resourcesQuery.data])
+
+  useEffect(() => {
+    if (!categoriesQuery.data) return
+    setResourceCategories(categoriesQuery.data)
+  }, [categoriesQuery.data])
+
+  useEffect(() => {
+    if (!messagesQuery.data) return
+    setMessages(messagesQuery.data.messages)
+    setRepliesByPost(messagesQuery.data.repliesByPost)
+  }, [messagesQuery.data])
+
+  useEffect(() => {
+    if (usersQuery.data) setUsers(usersQuery.data)
+  }, [usersQuery.data])
+
+  useEffect(() => {
+    const firstError =
+      statsQuery.error ||
+      resourcesQuery.error ||
+      categoriesQuery.error ||
+      messagesQuery.error ||
+      usersQuery.error
+
+    if (!firstError) {
+      setErrorText('')
+      return
+    }
+
+    setErrorText(firstError.message || '后台数据读取失败')
+  }, [statsQuery.error, resourcesQuery.error, categoriesQuery.error, messagesQuery.error, usersQuery.error])
+
   async function refreshStats() {
-    const [r, m, p, u] = await Promise.all([
-      supabase.from('resources').select('*', { count: 'exact', head: true }),
-      supabase.from('messages').select('*', { count: 'exact', head: true }),
-      supabase.from('messages').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
-      supabase.from('profiles').select('*', { count: 'exact', head: true }),
-    ])
-    setStats({
-      resources: typeof r.count === 'number' ? r.count : 0,
-      messages: typeof m.count === 'number' ? m.count : 0,
-      pending: typeof p.count === 'number' ? p.count : 0,
-      users: typeof u.count === 'number' ? u.count : 0,
-    })
+    await queryClient.invalidateQueries({ queryKey: ['admin_stats'] })
   }
 
   async function refreshResources() {
-    const result = await supabase.from('resources').select('*').order('created_at', { ascending: false })
-    if (result.error) {
-      setErrorText(`读取资源失败：${result.error.message}`)
-      return
-    }
-    setResources((result.data || []).map(normalizeResource))
+    await queryClient.invalidateQueries({ queryKey: ['admin_resources'] })
   }
 
   async function refreshResourceCategories() {
-    const result = await supabase
-      .from('resource_categories')
-      .select('id,name,emoji,sort_order,is_active,created_at')
-      .eq('is_active', true)
-      .order('sort_order', { ascending: true })
-      .order('created_at', { ascending: true })
-
-    if (result.error) {
-      setResourceCategories(DEFAULT_RESOURCE_CATEGORIES)
-      return
-    }
-
-    const rows = (result.data || [])
-      .map((item) => ({
-        id: item.id,
-        name: String(item.name || '').trim(),
-        emoji: String(item.emoji || '').trim() || '📁',
-        sort_order: typeof item.sort_order === 'number' ? item.sort_order : 100,
-      }))
-      .filter((item) => item.name)
-
-    setResourceCategories(rows.length ? rows : DEFAULT_RESOURCE_CATEGORIES)
+    await queryClient.invalidateQueries({ queryKey: ['admin_resource_categories'] })
   }
 
   async function refreshMessages() {
-    const [m, r] = await Promise.all([
-      supabase
-        .from('messages')
-        .select('id,user_id,title,content,category,status,is_done,created_at,vote_count,reply_count')
-        .order('created_at', { ascending: false }),
-      supabase
-        .from('message_replies')
-        .select('id,post_id,user_id,content,is_official,created_at')
-        .order('created_at', { ascending: true }),
-    ])
-    if (m.error) {
-      setErrorText(`读取留言失败：${m.error.message}`)
-      return
-    }
-    if (r.error) {
-      setErrorText(`读取回复失败：${r.error.message}`)
-      return
-    }
-    setMessages((m.data || []).map(normalizeMessage))
-    setRepliesByPost(mapRepliesByPost(r.data || []))
+    await queryClient.invalidateQueries({ queryKey: ['admin_messages_bundle'] })
   }
 
   async function refreshUsers() {
-    let result = await supabase
-      .from('profiles')
-      .select('id,email,role,user_role,status,account_status,disabled,created_at,inserted_at')
-      .order('created_at', { ascending: false })
-
-    if (result.error && /column .* does not exist/i.test(String(result.error.message || ''))) {
-      result = await supabase.from('profiles').select('*')
-    }
-    if (result.error) {
-      setErrorText(`读取用户失败：${result.error.message}`)
-      return
-    }
-    setUsers((result.data || []).map(mapUserRow))
+    await queryClient.invalidateQueries({ queryKey: ['admin_users'] })
   }
 
   async function refreshAll() {
     setErrorText('')
-    await Promise.all([refreshStats(), refreshResources(), refreshResourceCategories(), refreshMessages(), refreshUsers()])
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['admin_stats'] }),
+      queryClient.invalidateQueries({ queryKey: ['admin_resources'] }),
+      queryClient.invalidateQueries({ queryKey: ['admin_resource_categories'] }),
+      queryClient.invalidateQueries({ queryKey: ['admin_messages_bundle'] }),
+      queryClient.invalidateQueries({ queryKey: ['admin_users'] }),
+    ])
   }
-
   function updateResourceForm(field, value) {
     setResourceForm((prev) => ({ ...prev, [field]: value }))
   }
@@ -1442,6 +1508,9 @@ export default function Admin({ user, onLogout }) {
     </main>
   )
 }
+
+
+
 
 
 
